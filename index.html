@@ -697,6 +697,71 @@
     .accuracy-chip.low { background: rgba(255,107,107,0.12); border: 1px solid rgba(255,107,107,0.25); color: var(--danger); }
     .accuracy-chip::before { content: '●'; font-size: 0.5rem; }
 
+    /* ===== CONFLICT WARNING ===== */
+    .conflict-banner {
+      display: none;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      background: rgba(255,159,67,0.1);
+      border: 1px solid rgba(255,159,67,0.3);
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      color: var(--warning);
+      line-height: 1.5;
+    }
+    .conflict-banner.visible { display: flex; }
+    .conflict-banner svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; }
+    .conflict-banner strong { font-weight: 700; }
+
+    .alt-pincode-btns {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    .alt-btn {
+      padding: 5px 12px;
+      border-radius: 8px;
+      font-family: 'Inter', sans-serif;
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: 1px solid rgba(255,159,67,0.4);
+      background: rgba(255,159,67,0.12);
+      color: var(--warning);
+      transition: var(--transition);
+    }
+    .alt-btn:hover { background: rgba(255,159,67,0.22); }
+    .alt-btn.selected { background: rgba(255,159,67,0.35); border-color: var(--warning); }
+
+    /* ===== WRONG PIN REPORT ===== */
+    .wrong-pin-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+
+    .btn-wrong-pin {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 0.78rem;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      padding: 0;
+      transition: color 0.2s;
+    }
+    .btn-wrong-pin:hover { color: var(--warning); }
+
     /* ===== RESPONSIVE ===== */
     @media (max-width: 500px) {
       .cta-card { padding: 28px 20px; }
@@ -810,6 +875,18 @@
             </div>
           </div>
 
+          <!-- Conflict warning shown when APIs disagree -->
+          <div class="conflict-banner" id="conflict-banner" role="alert">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+            <div>
+              <strong>Boundary area detected.</strong> Our two data sources returned different PIN codes — you may be near a postal zone boundary. Pick the correct one below:
+              <div class="alt-pincode-btns" id="alt-pincode-btns"></div>
+            </div>
+          </div>
+
           <div class="pincode-display" id="pincode-display">
             <div class="pincode-label">Postal / PIN Code</div>
             <div class="pincode-value" id="pincode-value" aria-live="polite">—</div>
@@ -873,6 +950,12 @@
             </svg>
             View on Google Maps
           </a>
+
+          <!-- Wrong PIN report -->
+          <div class="wrong-pin-row">
+            <span>Result not matching?</span>
+            <button class="btn-wrong-pin" id="btn-wrong-pin" onclick="reportWrongPin()" aria-label="Report incorrect PIN code">Wrong PIN? Verify here →</button>
+          </div>
         </div>
 
         <!-- ERROR STATE -->
@@ -1028,38 +1111,70 @@
     }
 
     // ===== REVERSE GEOCODING =====
+    // Queries BOTH APIs in parallel. Cross-validates results.
+    // Prefers Nominatim for India (more granular OSM boundary data).
+    // Shows conflict warning when APIs disagree.
     async function reverseGeocode(lat, lng) {
-      // Primary: BigDataCloud (client-side, no API key)
-      try {
-        const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
-        const res = await fetchWithTimeout(url, 8000);
-        if (!res.ok) throw new Error('BigDataCloud returned ' + res.status);
-        const json = await res.json();
+      const bdcPromise = fetchBDC(lat, lng);
+      const nomPromise = fetchNominatim(lat, lng);
 
-        if (json.postcode) return normalizeBDC(json);
-        throw new Error('No postcode from BigDataCloud');
-      } catch (e) {
-        console.warn('BigDataCloud failed, trying Nominatim…', e.message);
+      // Settle both without throwing
+      const [bdcResult, nomResult] = await Promise.allSettled([bdcPromise, nomPromise]);
+
+      const bdc = bdcResult.status === 'fulfilled' ? bdcResult.value : null;
+      const nom = nomResult.status === 'fulfilled' ? nomResult.value : null;
+
+      console.log('BigDataCloud result:', bdc?.pincode, '| Nominatim result:', nom?.pincode);
+
+      if (!bdc && !nom) {
+        throw new Error(
+          'Unable to find a PIN code for your location. This can happen in very rural areas or if postal data is not available for your region. Try moving slightly and retrying.'
+        );
       }
 
-      // Fallback: Nominatim (OpenStreetMap)
-      try {
-        const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
-        const res = await fetchWithTimeout(url, 10000, {
-          headers: { 'Accept-Language': 'en', 'User-Agent': 'PinPoint-App/1.0 (https://github.com/pinpoint-app)' }
-        });
-        if (!res.ok) throw new Error('Nominatim returned ' + res.status);
-        const json = await res.json();
-
-        if (json.address?.postcode) return normalizeNominatim(json);
-        throw new Error('No postcode from Nominatim either');
-      } catch (e) {
-        console.warn('Nominatim also failed:', e.message);
+      // Both returned the same PIN — high confidence
+      if (bdc && nom && bdc.pincode === nom.pincode) {
+        return { ...bdc, confidence: 'high', altPincode: null };
       }
 
-      throw new Error(
-        'Unable to find a PIN code for your location. This can happen in very rural areas or if postal data is not available for your region. Try moving slightly and retrying.'
-      );
+      // They disagree — flag it and prefer Nominatim (OSM has more granular
+      // postal boundaries especially for Indian cities like Bengaluru)
+      if (bdc && nom) {
+        // For India specifically, OSM/Nominatim boundary data is more accurate
+        const isIndia = (nom.country || bdc.country || '').toLowerCase().includes('india');
+        const primary = isIndia ? nom : nom;   // prefer Nominatim in all cases
+        const secondary = isIndia ? bdc : bdc;
+        return {
+          ...primary,
+          confidence: 'conflict',
+          altPincode: secondary.pincode,
+          altSource: 'BigDataCloud'
+        };
+      }
+
+      // Only one succeeded
+      const result = bdc || nom;
+      return { ...result, confidence: 'single', altPincode: null };
+    }
+
+    async function fetchBDC(lat, lng) {
+      const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
+      const res = await fetchWithTimeout(url, 8000);
+      if (!res.ok) throw new Error('BigDataCloud returned ' + res.status);
+      const json = await res.json();
+      if (!json.postcode) throw new Error('No postcode from BigDataCloud');
+      return normalizeBDC(json);
+    }
+
+    async function fetchNominatim(lat, lng) {
+      const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
+      const res = await fetchWithTimeout(url, 10000, {
+        headers: { 'Accept-Language': 'en', 'User-Agent': 'PinPoint-App/1.0 (https://mayank2969.github.io/pinpoint)' }
+      });
+      if (!res.ok) throw new Error('Nominatim returned ' + res.status);
+      const json = await res.json();
+      if (!json.address?.postcode) throw new Error('No postcode from Nominatim');
+      return normalizeNominatim(json);
     }
 
     function fetchWithTimeout(url, ms, options = {}) {
@@ -1112,9 +1227,46 @@
       if (accuracy > 500) { accClass = 'low'; accLabel = 'Low Accuracy'; }
       accContainer.innerHTML = `<span class="accuracy-chip ${accClass}" title="GPS accuracy: ±${Math.round(accuracy)}m">GPS ±${Math.round(accuracy)}m · ${accLabel}</span>`;
 
+      // Conflict banner — show when APIs returned different PIN codes
+      const banner = document.getElementById('conflict-banner');
+      const altBtns = document.getElementById('alt-pincode-btns');
+      if (data.confidence === 'conflict' && data.altPincode) {
+        banner.classList.add('visible');
+        // Build selector buttons for both options
+        const pin1 = data.pincode;
+        const pin2 = data.altPincode;
+        altBtns.innerHTML = '';
+        [pin1, pin2].forEach((pin, i) => {
+          const btn = document.createElement('button');
+          btn.className = 'alt-btn' + (i === 0 ? ' selected' : '');
+          btn.textContent = pin + (i === 0 ? ' (OSM ✓)' : ' (BDC)');
+          btn.onclick = () => {
+            currentPincode = pin;
+            document.getElementById('pincode-value').textContent = pin;
+            // Animate re-reveal
+            const pv = document.getElementById('pincode-value');
+            pv.style.animation = 'none'; void pv.offsetWidth;
+            pv.style.animation = 'numberReveal 0.5s cubic-bezier(0.34,1.56,0.64,1) both';
+            altBtns.querySelectorAll('.alt-btn').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+            showToast(`✅ PIN Code set to ${pin}`);
+          };
+          altBtns.appendChild(btn);
+        });
+      } else {
+        banner.classList.remove('visible');
+        altBtns.innerHTML = '';
+      }
+
       // Map link
       const mapLink = document.getElementById('map-link');
       mapLink.href = `https://www.google.com/maps?q=${lat},${lng}`;
+
+      // Wrong PIN button — link to India Post for Indian addresses
+      const wrongBtn = document.getElementById('btn-wrong-pin');
+      wrongBtn.dataset.lat = lat;
+      wrongBtn.dataset.lng = lng;
+      wrongBtn.dataset.country = data.country || '';
 
       // Reset copy button
       const copyBtn = document.getElementById('btn-copy');
@@ -1156,9 +1308,28 @@
       }
     }
 
+    // ===== WRONG PIN REPORT =====
+    function reportWrongPin() {
+      const btn = document.getElementById('btn-wrong-pin');
+      const country = (btn.dataset.country || '').toLowerCase();
+      const lat = btn.dataset.lat;
+      const lng = btn.dataset.lng;
+
+      let verifyUrl;
+      if (country.includes('india')) {
+        // India Post official PIN finder
+        verifyUrl = `https://www.indiapost.gov.in/VAS/Pages/findpincode.aspx`;
+      } else {
+        // Google Maps for global
+        verifyUrl = `https://www.google.com/maps?q=${lat},${lng}`;
+      }
+      window.open(verifyUrl, '_blank', 'noopener,noreferrer');
+      showToast('🔍 Opening India Post to verify your PIN code');
+    }
+
     // ===== SHARE =====
     async function shareLocation() {
-      const text = `My current PIN code is ${currentPincode}\nLocation: ${currentLat?.toFixed(5)}, ${currentLng?.toFixed(5)}\nFound with PinPoint → https://pinpoint-app.github.io`;
+      const text = `My current PIN code is ${currentPincode}\nLocation: ${currentLat?.toFixed(5)}, ${currentLng?.toFixed(5)}\nFound with PinPoint → https://mayank2969.github.io/pinpoint/`;
       if (navigator.share) {
         try {
           await navigator.share({ title: `My PIN Code: ${currentPincode}`, text, url: window.location.href });
