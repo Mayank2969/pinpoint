@@ -6,7 +6,7 @@
 
 ## 🚀 Live Demo
 
-🔗 **[pinpoint-app.github.io](https://pinpoint-app.github.io)** _(replace with your actual URL after deployment)_
+🔗 **[mayank2969.github.io/pinpoint](https://mayank2969.github.io/pinpoint/)**
 
 ## ✨ Features
 
