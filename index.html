@@ -852,7 +852,7 @@
               </div>
               <div class="loading-step" id="step-lookup">
                 <div class="step-dot" aria-hidden="true"></div>
-                <span>🔍 Looking up postal data</span>
+                <span>🔍 Sampling nearby addresses for PIN code</span>
               </div>
               <div class="loading-step" id="step-done">
                 <div class="step-dot" aria-hidden="true"></div>
@@ -1110,62 +1110,215 @@
       });
     }
 
-    // ===== REVERSE GEOCODING =====
-    // Queries BOTH APIs in parallel. Cross-validates results.
-    // Prefers Nominatim for India (more granular OSM boundary data).
-    // Shows conflict warning when APIs disagree.
+    // ===== GEOCODING ENGINE (3-tier) =====
+    //
+    // TIER 1 — Overpass address majority vote (most accurate)
+    //   Fetches up to 200 real street addresses tagged with addr:postcode
+    //   within 1 km. Returns the most-common postcode (mode). No boundary
+    //   polygons — pure ground-truth building/node data.
+    //
+    // TIER 2 — Overpass nearest post office
+    //   Falls back to the postcode on the geographically closest post office
+    //   node/way within 5 km.
+    //
+    // TIER 3 — BigDataCloud + Nominatim (legacy fallback)
+    //   Used only when Overpass has no data (very rural / no OSM coverage).
+    //
     async function reverseGeocode(lat, lng) {
-      const bdcPromise = fetchBDC(lat, lng);
-      const nomPromise = fetchNominatim(lat, lng);
 
-      // Settle both without throwing
-      const [bdcResult, nomResult] = await Promise.allSettled([bdcPromise, nomPromise]);
+      // Run Tier-1 and Tier-2 in parallel, Tier-3 also in parallel so it's
+      // ready as a fallback without adding extra latency.
+      const [overpassAddr, overpassPO, bdcResult, nomResult] = await Promise.allSettled([
+        fetchOverpassAddresses(lat, lng),
+        fetchOverpassPostOffice(lat, lng),
+        fetchBDC(lat, lng),
+        fetchNominatim(lat, lng)
+      ]);
 
-      const bdc = bdcResult.status === 'fulfilled' ? bdcResult.value : null;
-      const nom = nomResult.status === 'fulfilled' ? nomResult.value : null;
+      const addrPin  = overpassAddr.status === 'fulfilled' ? overpassAddr.value : null;
+      const poPin    = overpassPO.status   === 'fulfilled' ? overpassPO.value   : null;
+      const bdcPin   = bdcResult.status    === 'fulfilled' ? bdcResult.value    : null;
+      const nomPin   = nomResult.status    === 'fulfilled' ? nomResult.value    : null;
 
-      console.log('BigDataCloud result:', bdc?.pincode, '| Nominatim result:', nom?.pincode);
+      console.log('[PinPoint] Overpass addresses vote:', addrPin?.pincode,
+                  '| Post office:', poPin?.pincode,
+                  '| BDC:', bdcPin?.pincode,
+                  '| Nom:', nomPin?.pincode);
 
-      if (!bdc && !nom) {
-        throw new Error(
-          'Unable to find a PIN code for your location. This can happen in very rural areas or if postal data is not available for your region. Try moving slightly and retrying.'
-        );
-      }
-
-      // Both returned the same PIN — high confidence
-      if (bdc && nom && bdc.pincode === nom.pincode) {
-        return { ...bdc, confidence: 'high', altPincode: null };
-      }
-
-      // They disagree — flag it and prefer Nominatim (OSM has more granular
-      // postal boundaries especially for Indian cities like Bengaluru)
-      if (bdc && nom) {
-        // For India specifically, OSM/Nominatim boundary data is more accurate
-        const isIndia = (nom.country || bdc.country || '').toLowerCase().includes('india');
-        const primary = isIndia ? nom : nom;   // prefer Nominatim in all cases
-        const secondary = isIndia ? bdc : bdc;
+      // ---- Tier 1: majority vote from real addresses ----
+      if (addrPin) {
+        // Cross-check with post office for extra confidence
+        const agreed = poPin && poPin.pincode === addrPin.pincode;
         return {
-          ...primary,
-          confidence: 'conflict',
-          altPincode: secondary.pincode,
-          altSource: 'BigDataCloud'
+          ...addrPin,
+          confidence: agreed ? 'high' : 'medium',
+          altPincode: (poPin && poPin.pincode !== addrPin.pincode) ? poPin.pincode : null
         };
       }
 
-      // Only one succeeded
-      const result = bdc || nom;
-      return { ...result, confidence: 'single', altPincode: null };
+      // ---- Tier 2: nearest post office ----
+      if (poPin) {
+        return { ...poPin, confidence: 'medium', altPincode: null };
+      }
+
+      // ---- Tier 3: legacy APIs ----
+      if (!bdcPin && !nomPin) {
+        throw new Error(
+          'Unable to find a PIN code for your location. ' +
+          'This can happen in very rural areas with no address data. ' +
+          'Try moving slightly and retrying.'
+        );
+      }
+
+      // Both legacy sources agree
+      if (bdcPin && nomPin && bdcPin.pincode === nomPin.pincode) {
+        return { ...nomPin, confidence: 'medium', altPincode: null };
+      }
+
+      // Legacy sources disagree — show both options to the user
+      if (bdcPin && nomPin) {
+        return {
+          ...nomPin,
+          confidence: 'conflict',
+          altPincode: bdcPin.pincode
+        };
+      }
+
+      const fallback = nomPin || bdcPin;
+      return { ...fallback, confidence: 'low', altPincode: null };
     }
 
+    // ------------------------------------------------------------------
+    // Tier 1: Overpass — sample nearest 200 real addresses, return mode
+    // ------------------------------------------------------------------
+    async function fetchOverpassAddresses(lat, lng) {
+      // Query nodes/ways/relations with addr:postcode within 1 km
+      const query = `
+[out:json][timeout:15];
+(
+  node["addr:postcode"](around:1000,${lat},${lng});
+  way["addr:postcode"](around:1000,${lat},${lng});
+);
+out tags 200;`;
+
+      const url = 'https://overpass-api.de/api/interpreter';
+      const res = await fetchWithTimeout(url, 15000, {
+        method: 'POST',
+        body: query,
+        headers: { 'Content-Type': 'text/plain' }
+      });
+      if (!res.ok) throw new Error('Overpass addr returned ' + res.status);
+      const json = await res.json();
+
+      if (!json.elements || json.elements.length === 0)
+        throw new Error('No address data from Overpass');
+
+      // Collect postcodes and compute distances for weighted voting
+      const votes = {};
+      for (const el of json.elements) {
+        const pc = el.tags?.['addr:postcode'];
+        if (!pc) continue;
+        // Normalise Indian postcodes (strip spaces)
+        const norm = pc.replace(/\s+/g, '').trim();
+        votes[norm] = (votes[norm] || 0) + 1;
+      }
+
+      if (Object.keys(votes).length === 0)
+        throw new Error('No valid postcodes in Overpass address data');
+
+      // Pick the mode (most common)
+      const winner = Object.entries(votes).sort((a, b) => b[1] - a[1])[0][0];
+      console.log('[PinPoint] Address vote tally:', votes, '→ winner:', winner);
+
+      // Get supplementary locality info from Nominatim (non-blocking best-effort)
+      let area = '', district = '', state = '', country = '';
+      try {
+        const nom = await fetchNominatim(lat, lng);
+        area = nom.area; district = nom.district;
+        state = nom.state; country = nom.country;
+      } catch (_) {/* no-op */}
+
+      // Also try BDC for locality names
+      if (!area) {
+        try {
+          const bdc = await fetchBDC(lat, lng);
+          area = bdc.area; district = bdc.district;
+          state = bdc.state; country = bdc.country;
+        } catch (_) {/* no-op */}
+      }
+
+      return { pincode: winner, area, district, state, country };
+    }
+
+    // ------------------------------------------------------------------
+    // Tier 2: Overpass — nearest post office with a postcode tag
+    // ------------------------------------------------------------------
+    async function fetchOverpassPostOffice(lat, lng) {
+      const query = `
+[out:json][timeout:15];
+(
+  node["amenity"="post_office"](around:5000,${lat},${lng});
+  way["amenity"="post_office"](around:5000,${lat},${lng});
+);
+out center tags;`;
+
+      const url = 'https://overpass-api.de/api/interpreter';
+      const res = await fetchWithTimeout(url, 15000, {
+        method: 'POST',
+        body: query,
+        headers: { 'Content-Type': 'text/plain' }
+      });
+      if (!res.ok) throw new Error('Overpass PO returned ' + res.status);
+      const json = await res.json();
+
+      if (!json.elements || json.elements.length === 0)
+        throw new Error('No post offices from Overpass');
+
+      // Find nearest post office that has a postcode tag
+      const haversine = (lat1, lng1, lat2, lng2) => {
+        const R = 6371000, dLat = (lat2-lat1)*Math.PI/180, dLng = (lng2-lng1)*Math.PI/180;
+        const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      };
+
+      let nearest = null, nearestDist = Infinity;
+      for (const el of json.elements) {
+        const pc = el.tags?.['addr:postcode'] || el.tags?.['postal_code'] || el.tags?.['post_code'];
+        if (!pc) continue;
+        const elLat = el.lat ?? el.center?.lat;
+        const elLng = el.lon ?? el.center?.lon;
+        if (!elLat) continue;
+        const dist = haversine(lat, lng, elLat, elLng);
+        if (dist < nearestDist) { nearestDist = dist; nearest = { pc: pc.replace(/\s+/g,'').trim(), name: el.tags?.name || '' }; }
+      }
+
+      if (!nearest) throw new Error('Post offices found but none have postcode tags');
+      console.log('[PinPoint] Nearest post office:', nearest.name, nearest.pc, `(${Math.round(nearestDist)}m)`);
+
+      return { pincode: nearest.pc, area: nearest.name, district: '', state: '', country: '' };
+    }
+
+    // ------------------------------------------------------------------
+    // Tier 3a: BigDataCloud
+    // ------------------------------------------------------------------
     async function fetchBDC(lat, lng) {
       const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`;
       const res = await fetchWithTimeout(url, 8000);
       if (!res.ok) throw new Error('BigDataCloud returned ' + res.status);
       const json = await res.json();
       if (!json.postcode) throw new Error('No postcode from BigDataCloud');
-      return normalizeBDC(json);
+      return {
+        pincode: json.postcode,
+        area: json.locality || json.localityInfo?.administrative?.[4]?.name || json.city || '',
+        district: json.city || json.county || json.principalSubdivision || '',
+        state: json.principalSubdivision || '',
+        country: json.countryName || ''
+      };
     }
 
+    // ------------------------------------------------------------------
+    // Tier 3b: Nominatim (OpenStreetMap reverse geocoding)
+    // ------------------------------------------------------------------
     async function fetchNominatim(lat, lng) {
       const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
       const res = await fetchWithTimeout(url, 10000, {
@@ -1174,7 +1327,14 @@
       if (!res.ok) throw new Error('Nominatim returned ' + res.status);
       const json = await res.json();
       if (!json.address?.postcode) throw new Error('No postcode from Nominatim');
-      return normalizeNominatim(json);
+      const a = json.address;
+      return {
+        pincode: a.postcode,
+        area: a.suburb || a.neighbourhood || a.hamlet || a.village || a.town || a.city_district || '',
+        district: a.city || a.town || a.county || a.state_district || '',
+        state: a.state || '',
+        country: a.country || ''
+      };
     }
 
     function fetchWithTimeout(url, ms, options = {}) {
@@ -1182,30 +1342,6 @@
       const id = setTimeout(() => controller.abort(), ms);
       return fetch(url, { ...options, signal: controller.signal })
         .finally(() => clearTimeout(id));
-    }
-
-    // ===== NORMALIZE RESPONSES =====
-    function normalizeBDC(json) {
-      return {
-        pincode: json.postcode,
-        area: json.locality || json.localityInfo?.administrative?.[4]?.name || json.city || '',
-        district: json.city || json.county || json.principalSubdivision || '',
-        state: json.principalSubdivision || '',
-        country: json.countryName || '',
-        displayName: [json.locality, json.city, json.principalSubdivision, json.countryName].filter(Boolean).join(', ')
-      };
-    }
-
-    function normalizeNominatim(json) {
-      const a = json.address;
-      return {
-        pincode: a.postcode,
-        area: a.suburb || a.neighbourhood || a.hamlet || a.village || a.town || a.city_district || '',
-        district: a.city || a.town || a.county || a.state_district || '',
-        state: a.state || '',
-        country: a.country || '',
-        displayName: json.display_name || ''
-      };
     }
 
     // ===== DISPLAY RESULT =====
